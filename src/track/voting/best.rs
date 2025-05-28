@@ -127,3 +127,101 @@ where
         res
     }
 }
+
+pub struct BestFitVotingWithFallback<OA>
+where
+    OA: ObservationAttributes,
+{
+    pub max_distance: f32,
+    pub min_votes: usize,
+    _phantom: PhantomData<OA>,
+}
+
+impl<OA> BestFitVotingWithFallback<OA>
+where
+    OA: ObservationAttributes,
+{
+    pub fn new(max_distance: f32, min_votes: usize) -> Self {
+        Self {
+            max_distance,
+            min_votes,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<OA> Voting<OA> for BestFitVotingWithFallback<OA>
+where
+    OA: ObservationAttributes,
+{
+    type WinnerObject = TopNVotingElt;
+
+    fn winners<T>(&self, distances: T) -> HashMap<u64, Vec<TopNVotingElt>>
+    where
+        T: IntoIterator<Item = ObservationMetricOk<OA>>,
+    {
+        let mut max_dist = -1.0_f32;
+
+        // Step 1: group all distances by (from, to), filter by max_distance
+        let grouped: HashMap<(u64, u64), Vec<f32>> = distances
+            .into_iter()
+            .filter_map(|d| match d.feature_distance {
+                Some(f) if f <= self.max_distance => {
+                    max_dist = max_dist.max(f);
+                    Some(((d.from, d.to), f))
+                }
+                _ => None,
+            })
+            .into_group_map();
+
+        // Step 2: filter by min_votes
+        let filtered: Vec<TopNVotingElt> = grouped
+            .into_iter()
+            .filter(|(_, v)| v.len() >= self.min_votes)
+            .map(|((from, to), dists)| {
+                let weight = dists.into_iter().map(|d| (max_dist - d) as f64).sum();
+                TopNVotingElt {
+                    query_track: from,
+                    winner_track: to,
+                    weight,
+                }
+            })
+            .collect();
+
+        // Step 3: group by query (from), and sort each list by descending weight
+        let mut per_query = filtered.into_iter().into_group_map_by(|e| e.query_track);
+
+        for candidates in per_query.values_mut() {
+            candidates.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap());
+        }
+
+        // Step 4: assign each query to its best available winner (fallback to self)
+        let mut used_winners = HashSet::new();
+        let mut final_map = HashMap::new();
+
+        for (query_id, candidates) in per_query {
+            let mut assigned = false;
+            for mut cand in candidates {
+                if !used_winners.contains(&cand.winner_track) {
+                    used_winners.insert(cand.winner_track);
+                    final_map.insert(query_id, vec![cand]);
+                    assigned = true;
+                    break;
+                }
+            }
+
+            if !assigned {
+                final_map.insert(
+                    query_id,
+                    vec![TopNVotingElt {
+                        query_track: query_id,
+                        winner_track: query_id,
+                        weight: 0.0,
+                    }],
+                );
+            }
+        }
+
+        final_map
+    }
+}
