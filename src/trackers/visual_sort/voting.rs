@@ -3,7 +3,7 @@ use crate::trackers::sort::voting::SortVoting;
 use crate::trackers::sort::VotingType;
 use crate::trackers::visual_sort::observation_attributes::VisualObservationAttributes;
 use crate::utils::bbox::Universal2DBox;
-use crate::voting::best::BestFitVoting;
+use crate::voting::best::BestFitVotingWithFallback;
 use crate::voting::Voting;
 use itertools::Itertools;
 use log::debug;
@@ -49,25 +49,39 @@ impl Voting<VisualObservationAttributes> for VisualVoting {
     where
         T: IntoIterator<Item = ObservationMetricOk<VisualObservationAttributes>>,
     {
-        let topn_feature_voting: BestFitVoting<VisualObservationAttributes> = BestFitVoting::new(
-            self.max_allowed_feature_distance,
-            self.min_winner_feature_votes,
-        );
+        let topn_feature_voting: BestFitVotingWithFallback<VisualObservationAttributes> =
+            BestFitVotingWithFallback::new(
+                self.max_allowed_feature_distance,
+                self.min_winner_feature_votes,
+            );
 
         let (distances, distances_clone) = distances.into_iter().tee();
 
-        let feature_winners = topn_feature_voting.winners(distances);
-        debug!("TopN winners: {:#?}", &feature_winners);
+        // First round: feature-based voting
+        let raw_feature_winners: HashMap<u64, Vec<TopNVotingElt>> =
+            topn_feature_voting.winners(distances);
+        debug!("TopN raw_feature_winners: {:#?}", &raw_feature_winners);
 
         let mut excluded_tracks = HashSet::new();
-        let mut feature_winners = feature_winners
+        let mut feature_winners = HashMap::new();
+
+        raw_feature_winners
             .into_iter()
-            .map(|(from, w)| {
-                let winner_track = w[0].winner_track;
-                excluded_tracks.insert(winner_track);
-                (from, vec![(winner_track, VotingType::Visual)])
-            })
-            .collect::<HashMap<_, _>>();
+            .for_each(|(from, winner_list)| {
+                let TopNVotingElt {
+                    winner_track,
+                    query_track,
+                    ..
+                } = winner_list[0];
+
+                if winner_track != query_track {
+                    excluded_tracks.insert(winner_track);
+                    feature_winners.insert(from, vec![(winner_track, VotingType::Visual)]);
+                }
+            });
+
+        debug!("TopN winners: {:#?}", &feature_winners);
+        debug!("Excluded tracks: {:#?}", &excluded_tracks);
 
         let mut remaining_candidates = HashSet::new();
         let mut remaining_tracks = HashSet::new();
@@ -95,6 +109,7 @@ impl Voting<VisualObservationAttributes> for VisualVoting {
             .into_iter()
             .map(|(from, winner)| (from, vec![(winner[0], VotingType::Positional)]));
 
+        debug!("positional_winners: {:#?}", &positional_winners);
         feature_winners.extend(positional_winners);
         feature_winners
     }
